@@ -19,7 +19,10 @@ import {
   createProviderCheckout,
   type CheckoutResult,
 } from "./paymentProvider.ts";
-import { calculatePaymentPrice } from "../../../services/pricingService";
+import {
+  calculatePaymentPrice,
+  type PaymentPrice,
+} from "../../../services/pricingService";
 import { apiKeyContextKey } from "../../../context/auth";
 import type { AuthContext } from "../../../context/auth";
 import { wideEventContextKey } from "../../../context/requestContext";
@@ -70,13 +73,10 @@ export async function createCheckoutLink(
 
     const db = getPostgresDB();
 
-    const beforeTimestamp = DateTime.utc();
-
-    const custom_price = await calculatePrice(
-      validatedData.userId,
-      beforeTimestamp,
-      auth
-    );
+    // The cutoff comes from pricing itself so it matches exactly what was
+    // summed; it becomes the session's billed_upto.
+    const { price: custom_price, billedUpto: beforeTimestamp } =
+      await calculatePrice(validatedData.userId, auth);
     wideEventBuilder?.setPaymentContext({ priceAmount: custom_price });
 
     const checkoutLink = await executeInTransaction(
@@ -156,10 +156,10 @@ function validateRequest(
 
 async function calculatePrice(
   userId: UserId,
-  beforeTimestamp: DateTime,
   auth: AuthContext
-): Promise<number> {
-  const price = await calculatePaymentPrice(userId, beforeTimestamp, auth);
+): Promise<PaymentPrice> {
+  const result = await calculatePaymentPrice(userId, auth);
+  const price = result.price;
 
   if (typeof price !== "number" || isNaN(price) || price < 0) {
     throw PaymentError.priceCalculationFailed(
@@ -168,7 +168,7 @@ async function calculatePrice(
     );
   }
 
-  return price;
+  return result;
 }
 
 async function createCheckoutSession(

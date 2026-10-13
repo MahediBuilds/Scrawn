@@ -8,31 +8,45 @@ import {
 import { clearDatabase } from "./db";
 import { getPostgresDB } from "../storage/db/postgres/db";
 import { sessionsTable } from "../storage/db/postgres/schema";
+import { ensureUserExists } from "../storage/db/postgres/helpers/users";
+import {
+  lockUserForBilling,
+  getDatabaseNow,
+} from "../storage/db/postgres/helpers/billing";
 import { calculatePaymentPrice } from "../services/pricingService";
 import { BasicUsage } from "../events/BasicUsage";
 import { storeEvent } from "../utils/eventHelpers";
+import { StorageError } from "../errors/storage";
 import type { AuthContext } from "../context/auth";
 
-// Timestamps are stored with millisecond precision; a short pause keeps
-// "before" and "after" a payment strictly ordered.
-function tick(): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, 15));
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function storeBasic(
-  auth: AuthContext,
+function makeBasicUsage(
   userId: string,
   debitAmount: number,
   reportedTimestamp: DateTime = DateTime.utc()
-): Promise<void> {
-  const event = new BasicUsage(
+): BasicUsage {
+  return new BasicUsage(
     userId,
     reportedTimestamp,
     { basicUsageType: "RAW", debitAmount },
     crypto.randomUUID(),
     crypto.randomUUID()
   );
-  await storeEvent(event, auth);
+}
+
+async function storeBasic(
+  auth: AuthContext,
+  userId: string,
+  debitAmount: number,
+  reportedTimestamp?: DateTime
+): Promise<void> {
+  await storeEvent(
+    makeBasicUsage(userId, debitAmount, reportedTimestamp),
+    auth
+  );
 }
 
 async function recordPaidSession(
@@ -54,9 +68,18 @@ async function recordPaidSession(
     });
 }
 
-async function priceNow(auth: AuthContext, userId: string): Promise<number> {
-  await tick();
-  return calculatePaymentPrice(userId, DateTime.utc(), auth);
+/** Prices the user and marks that checkout as paid; returns the price. */
+async function checkoutAndPay(
+  auth: AuthContext,
+  userId: string
+): Promise<number> {
+  const { price, billedUpto } = await calculatePaymentPrice(userId, auth);
+  await recordPaidSession(auth, userId, billedUpto);
+  return price;
+}
+
+async function price(auth: AuthContext, userId: string): Promise<number> {
+  return (await calculatePaymentPrice(userId, auth)).price;
 }
 
 describe("Billing window", () => {
@@ -88,57 +111,99 @@ describe("Billing window", () => {
     await clearDatabase();
   });
 
-  it("bills only usage ingested since the last paid session", async () => {
+  it("bills only usage ingested since the last paid checkout", async () => {
     const userId = crypto.randomUUID();
 
     await storeBasic(testAuth, userId, 100);
-    await tick();
-    await recordPaidSession(testAuth, userId, DateTime.utc());
-    await tick();
+    expect(await checkoutAndPay(testAuth, userId)).toBe(100);
     await storeBasic(testAuth, userId, 40);
 
-    expect(await priceNow(testAuth, userId)).toBe(40);
+    expect(await price(testAuth, userId)).toBe(40);
   });
 
   it("bills late events whose reported timestamp predates the last payment", async () => {
     const userId = crypto.randomUUID();
 
     await storeBasic(testAuth, userId, 100);
-    await tick();
-    const paidAt = DateTime.utc();
-    await recordPaidSession(testAuth, userId, paidAt);
-    await tick();
-    await storeBasic(testAuth, userId, 25, paidAt.minus({ hours: 1 }));
+    await checkoutAndPay(testAuth, userId);
+    await storeBasic(testAuth, userId, 25, DateTime.utc().minus({ hours: 1 }));
 
-    expect(await priceNow(testAuth, userId)).toBe(25);
+    expect(await price(testAuth, userId)).toBe(25);
   });
 
   it("does not let test-mode payments affect production billing", async () => {
     const userId = crypto.randomUUID();
 
     await storeBasic(productionAuth, userId, 300);
-    await tick();
-    await recordPaidSession(testAuth, userId, DateTime.utc());
+    await checkoutAndPay(testAuth, userId);
 
-    expect(await priceNow(productionAuth, userId)).toBe(300);
+    expect(await price(productionAuth, userId)).toBe(300);
   });
 
-  it("does not reopen a billed window when an older session is paid last", async () => {
+  it("does not reopen a billed window when an older checkout is paid last", async () => {
     const userId = crypto.randomUUID();
 
     await storeBasic(testAuth, userId, 100);
-    await tick();
-    const olderBilledUpto = DateTime.utc();
-    await tick();
+    const older = await calculatePaymentPrice(userId, testAuth);
     await storeBasic(testAuth, userId, 50);
-    await tick();
-    const newerBilledUpto = DateTime.utc();
+    const newer = await calculatePaymentPrice(userId, testAuth);
 
-    await recordPaidSession(testAuth, userId, newerBilledUpto);
-    await recordPaidSession(testAuth, userId, olderBilledUpto);
-    await tick();
+    await recordPaidSession(testAuth, userId, newer.billedUpto);
+    await recordPaidSession(testAuth, userId, older.billedUpto);
     await storeBasic(testAuth, userId, 7);
 
-    expect(await priceNow(testAuth, userId)).toBe(7);
+    expect(await price(testAuth, userId)).toBe(7);
+  });
+
+  it("bills an event that is ingested while a checkout is being priced", async () => {
+    const userId = crypto.randomUUID();
+    await storeBasic(testAuth, userId, 100);
+
+    // Simulate checkout pricing holding the user lock, and an event arriving
+    // in the middle of it. The event must wait, and once the checkout is paid
+    // it must still be billable in the next window rather than lost.
+    let ingestion: Promise<void> | undefined;
+    let ingestionSettled = false;
+    const cutoff = await getPostgresDB().transaction(async (txn) => {
+      await ensureUserExists(testAuth.projectId, userId, txn);
+      await lockUserForBilling(testAuth.projectId, userId, txn);
+      const now = await getDatabaseNow(txn);
+
+      ingestion = storeBasic(testAuth, userId, 700).finally(() => {
+        ingestionSettled = true;
+      });
+      await sleep(300);
+      expect(ingestionSettled).toBe(false);
+      return now;
+    });
+
+    await ingestion;
+    await recordPaidSession(testAuth, userId, cutoff);
+
+    expect(await price(testAuth, userId)).toBe(700);
+  });
+
+  it("accepts exactly one of two concurrent events with the same idempotency key", async () => {
+    const userId = crypto.randomUUID();
+    const event = makeBasicUsage(userId, 100);
+
+    const results = await Promise.allSettled([
+      storeEvent(event, testAuth),
+      storeEvent(event, testAuth),
+    ]);
+
+    const fulfilled = results.filter((r) => r.status === "fulfilled");
+    const rejected = results.filter(
+      (r): r is PromiseRejectedResult => r.status === "rejected"
+    );
+    expect(fulfilled).toHaveLength(1);
+    expect(rejected).toHaveLength(1);
+    expect(rejected[0]!.reason).toBeInstanceOf(StorageError);
+    expect((rejected[0]!.reason as StorageError).type).toBe(
+      "CONSTRAINT_VIOLATION"
+    );
+
+    expect(await checkoutAndPay(testAuth, userId)).toBe(100);
+    expect(await price(testAuth, userId)).toBe(0);
   });
 });
