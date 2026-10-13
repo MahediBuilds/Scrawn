@@ -3,7 +3,7 @@ import { StorageError } from "../../../../errors/storage";
 import { type SqlRecordOf } from "../../../../interface/event/Event";
 import type { UserId } from "../../../../config/identifiers";
 import { DateTime } from "luxon";
-import { toClickHouseDateTime } from "../utils";
+import { toClickHouseDateTime, assertIdempotencyKeysUnused } from "../utils";
 import type { AuthContext } from "../../../../context/auth";
 import { ensureUserExists } from "../../../db/postgres/helpers/users";
 
@@ -166,6 +166,12 @@ export async function handleAddAiTokenUsage(
   }
 
   const aggregatedEvents = aggregateAiTokenEvents(events);
+
+  await assertIdempotencyKeysUnused(
+    "ai_token_usage_events",
+    auth.projectId,
+    aggregatedEvents.map((e) => e.idempotencyKey)
+  );
 
   const distinctUserIds = Array.from(
     new Set(aggregatedEvents.map((e) => e.userId))

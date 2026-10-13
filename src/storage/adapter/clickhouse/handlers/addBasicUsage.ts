@@ -2,7 +2,7 @@ import { getClickHouseDB } from "../../../db/clickhouse";
 import { StorageError } from "../../../../errors/storage";
 import { type SqlRecordOf } from "../../../../interface/event/Event";
 import { DateTime } from "luxon";
-import { toClickHouseDateTime } from "../utils";
+import { toClickHouseDateTime, assertIdempotencyKeysUnused } from "../utils";
 import type { AuthContext } from "../../../../context/auth";
 import { ensureUserExists } from "../../../db/postgres/helpers/users";
 
@@ -26,6 +26,10 @@ export async function handleAddBasicUsage(
     );
   }
   const reportedTimestamp = toClickHouseDateTime(event_data.reported_timestamp);
+
+  await assertIdempotencyKeysUnused("basic_usage_events", auth.projectId, [
+    event_data.idempotencyKey,
+  ]);
 
   await ensureUserExists(auth.projectId, event_data.userId);
 
