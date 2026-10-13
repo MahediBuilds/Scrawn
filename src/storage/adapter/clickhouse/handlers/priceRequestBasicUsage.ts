@@ -1,6 +1,7 @@
 import { DateTime } from "luxon";
 import type { UserId } from "../../../../config/identifiers";
 import type { AuthContext } from "../../../../context/auth";
+import type { PgTransaction } from "drizzle-orm/pg-core";
 import { runClickHousePriceQuery } from "../utils";
 
 // Duplicates are rejected at ingestion by the Postgres idempotency claim;
@@ -15,7 +16,8 @@ const WINDOW_QUERY =
 export async function handlePriceRequestBasicUsage(
   userId: UserId,
   beforeTimestamp: DateTime,
-  auth: AuthContext
+  auth: AuthContext,
+  txn?: PgTransaction<any, any, any>
 ): Promise<number> {
   return runClickHousePriceQuery(
     userId,
@@ -23,6 +25,7 @@ export async function handlePriceRequestBasicUsage(
     BASE_QUERY,
     WINDOW_QUERY,
     "BASIC_USAGE",
-    auth
+    auth,
+    txn
   );
 }

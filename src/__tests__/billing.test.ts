@@ -206,4 +206,20 @@ describe("Billing window", () => {
     expect(await checkoutAndPay(testAuth, userId)).toBe(100);
     expect(await price(testAuth, userId)).toBe(0);
   });
+
+  it("prices more concurrent checkouts than the connection pool holds", async () => {
+    // The Postgres pool has 15 connections. Each checkout holds one for its
+    // pricing transaction; if pricing needed a second connection, this many
+    // concurrent checkouts would wait on each other forever.
+    const userIds = Array.from({ length: 25 }, () => crypto.randomUUID());
+    for (const userId of userIds) {
+      await storeBasic(testAuth, userId, 10);
+    }
+
+    const prices = await Promise.all(
+      userIds.map((userId) => price(testAuth, userId))
+    );
+
+    expect(prices).toEqual(userIds.map(() => 10));
+  }, 15_000);
 });

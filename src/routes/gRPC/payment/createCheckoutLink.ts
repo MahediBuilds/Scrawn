@@ -16,6 +16,7 @@ import type {
 } from "./paymentProvider.ts";
 import {
   getPaymentProviderConfig,
+  getDodoClient,
   createProviderCheckout,
   type CheckoutResult,
 } from "./paymentProvider.ts";
@@ -78,6 +79,11 @@ export async function createCheckoutLink(
     const { price: custom_price, billedUpto: beforeTimestamp } =
       await calculatePrice(validatedData.userId, auth);
     wideEventBuilder?.setPaymentContext({ priceAmount: custom_price });
+
+    // Load (and cache) the provider client before opening the transaction:
+    // on a cache miss it reads project metadata from the pool, which must not
+    // happen while this request already holds a pooled connection.
+    await getDodoClient(auth.projectId, mode);
 
     const checkoutLink = await executeInTransaction(
       db,

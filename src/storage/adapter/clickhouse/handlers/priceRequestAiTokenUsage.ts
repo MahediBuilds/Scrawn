@@ -1,6 +1,7 @@
 import { DateTime } from "luxon";
 import type { UserId } from "../../../../config/identifiers";
 import type { AuthContext } from "../../../../context/auth";
+import type { PgTransaction } from "drizzle-orm/pg-core";
 import { runClickHousePriceQuery } from "../utils";
 
 const VALUE_EXPR =
@@ -12,7 +13,8 @@ const WINDOW_QUERY = `SELECT sum(${VALUE_EXPR}) as total FROM ai_token_usage_eve
 export async function handlePriceRequestAiTokenUsage(
   userId: UserId,
   beforeTimestamp: DateTime,
-  auth: AuthContext
+  auth: AuthContext,
+  txn?: PgTransaction<any, any, any>
 ): Promise<number> {
   return runClickHousePriceQuery(
     userId,
@@ -20,6 +22,7 @@ export async function handlePriceRequestAiTokenUsage(
     BASE_QUERY,
     WINDOW_QUERY,
     "AI_TOKEN_USAGE",
-    auth
+    auth,
+    txn
   );
 }

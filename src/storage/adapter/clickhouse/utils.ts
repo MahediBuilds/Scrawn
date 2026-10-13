@@ -13,6 +13,7 @@ import { StorageError } from "../../../errors/storage";
 import { getClickHouseDB } from "../../db/clickhouse";
 import type { UserId } from "../../../config/identifiers";
 import type { AuthContext } from "../../../context/auth";
+import type { PgTransaction } from "drizzle-orm/pg-core";
 
 export function toClickHouseDateTime(dt: DateTime): string {
   return dt.toUTC().toFormat("yyyy-MM-dd HH:mm:ss.SSS");
@@ -64,7 +65,8 @@ export async function runClickHousePriceQuery(
   baseQuery: string,
   windowQuery: string,
   eventLabel: string,
-  auth: AuthContext
+  auth: AuthContext,
+  txn?: PgTransaction<any, any, any>
 ): Promise<number> {
   const chClient = getClickHouseDB();
 
@@ -89,10 +91,13 @@ export async function runClickHousePriceQuery(
 
   // Errors here must propagate: silently falling back to the unbounded
   // query would bill the user for usage they have already paid for.
+  // Reuse the caller's transaction: checkout pricing already holds a pooled
+  // connection, and asking for a second one can exhaust the pool under load.
   const lastBilled = await getLastBilledTimestamp(
     auth.projectId,
     userId,
-    auth.mode
+    auth.mode,
+    txn
   );
 
   let query = baseQuery;
